@@ -16,7 +16,7 @@ class SnippetsController < ApplicationController
   layout :determine_layout
 
   def index
-    @snippets = SnippetsFinder.new.execute(current_user, filter: :all).page(params[:page]).per(20)
+    @snippets = SnippetsFinder.new.execute(current_user, filter: :all).page(params[:page]).per(PER_PAGE)
   end
 
   def user_index
@@ -27,8 +27,8 @@ class SnippetsController < ApplicationController
     @snippets = SnippetsFinder.new.execute(current_user, {
       filter: :by_user,
       user: @user,
-      scope: params[:scope]}).
-    page(params[:page]).per(20)
+      scope: params[:scope] }).
+    page(params[:page]).per(PER_PAGE)
 
     if @user == current_user
       render 'current_user_index'
@@ -79,7 +79,7 @@ class SnippetsController < ApplicationController
       @snippet.content,
       type: 'text/plain; charset=utf-8',
       disposition: 'inline',
-      filename: @snippet.file_name
+      filename: @snippet.sanitized_file_name
     )
   end
 
@@ -106,6 +106,7 @@ class SnippetsController < ApplicationController
 
   def set_title
     @title = 'Snippets'
+    @title_url = snippets_path
   end
 
   def snippet_params

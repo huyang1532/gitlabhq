@@ -2,14 +2,15 @@ class Admin::GroupsController < Admin::ApplicationController
   before_filter :group, only: [:edit, :show, :update, :destroy, :project_update, :project_teams_update]
 
   def index
-    @groups = Group.order('name ASC')
+    @groups = Group.all
+    @groups = @groups.sort(@sort = params[:sort])
     @groups = @groups.search(params[:name]) if params[:name].present?
-    @groups = @groups.page(params[:page]).per(20)
+    @groups = @groups.page(params[:page]).per(PER_PAGE)
   end
 
   def show
-    @members = @group.members.order("access_level DESC").page(params[:members_page]).per(30)
-    @projects = @group.projects.page(params[:projects_page]).per(30)
+    @members = @group.members.order("access_level DESC").page(params[:members_page]).per(PER_PAGE)
+    @projects = @group.projects.page(params[:projects_page]).per(PER_PAGE)
   end
 
   def new
@@ -21,7 +22,7 @@ class Admin::GroupsController < Admin::ApplicationController
 
   def create
     @group = Group.new(group_params)
-    @group.path = @group.name.dup.parameterize if @group.name
+    @group.name = @group.path.dup unless @group.name
 
     if @group.save
       @group.add_owner(current_user)

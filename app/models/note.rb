@@ -49,7 +49,7 @@ class Note < ActiveRecord::Base
   scope :not_inline, ->{ where(line_code: [nil, '']) }
   scope :system, ->{ where(system: true) }
   scope :common, ->{ where(noteable_type: ["", nil]) }
-  scope :fresh, ->{ order("created_at ASC, id ASC") }
+  scope :fresh, ->{ order(created_at: :asc, id: :asc) }
   scope :inc_author_project, ->{ includes(:project, :author) }
   scope :inc_author, ->{ includes(:author) }
 
@@ -121,18 +121,71 @@ class Note < ActiveRecord::Base
       })
     end
 
-    def create_new_commits_note(noteable, project, author, commits)
-      commits_text = ActionController::Base.helpers.pluralize(commits.size, 'new commit')
+    def create_labels_change_note(noteable, project, author, added_labels, removed_labels)
+      labels_count = added_labels.count + removed_labels.count
+      added_labels = added_labels.map{ |label| "~#{label.id}" }.join(' ')
+      removed_labels = removed_labels.map{ |label| "~#{label.id}" }.join(' ')
+      message = ''
+
+      if added_labels.present?
+        message << "added #{added_labels}"
+      end
+
+      if added_labels.present? && removed_labels.present?
+        message << ' and '
+      end
+
+      if removed_labels.present?
+        message << "removed #{removed_labels}"
+      end
+
+      message << ' ' << 'label'.pluralize(labels_count)
+      body = "_#{message.capitalize}_"
+
+      create(
+        noteable: noteable,
+        project: project,
+        author: author,
+        note: body,
+        system: true
+      )
+    end
+
+    def create_new_commits_note(merge_request, project, author, new_commits, existing_commits = [])
+      total_count = new_commits.length + existing_commits.length
+      commits_text = ActionController::Base.helpers.pluralize(total_count, 'commit')
       body = "Added #{commits_text}:\n\n"
 
-      commits.each do |commit|
+      if existing_commits.length > 0
+        commit_ids =
+          if existing_commits.length == 1
+            existing_commits.first.short_id
+          else
+            "#{existing_commits.first.short_id}..#{existing_commits.last.short_id}"
+          end
+
+        commits_text = ActionController::Base.helpers.pluralize(existing_commits.length, 'commit')
+
+        branch = 
+          if merge_request.for_fork?
+            "#{merge_request.target_project_namespace}:#{merge_request.target_branch}"
+          else
+            merge_request.target_branch
+          end
+
+        message = "* #{commit_ids} - _#{commits_text} from branch `#{branch}`_"
+        body << message
+        body << "\n"
+      end
+
+      new_commits.each do |commit|
         message = "* #{commit.short_id} - #{commit.title}"
         body << message
         body << "\n"
       end
 
       create(
-        noteable: noteable,
+        noteable: merge_request,
         project: project,
         author: author,
         note: body,
@@ -260,8 +313,8 @@ class Note < ActiveRecord::Base
 
   def commit_author
     @commit_author ||=
-      project.users.find_by(email: noteable.author_email) ||
-      project.users.find_by(name: noteable.author_name)
+      project.team.users.find_by(email: noteable.author_email) ||
+      project.team.users.find_by(name: noteable.author_name)
   rescue
     nil
   end
@@ -276,6 +329,10 @@ class Note < ActiveRecord::Base
     @diff ||= noteable.diffs.find do |d|
       Digest::SHA1.hexdigest(d.new_path) == diff_file_index if d.new_path
     end
+  end
+
+  def hook_attrs
+    attributes
   end
 
   def set_diff
@@ -296,6 +353,7 @@ class Note < ActiveRecord::Base
   # If not - its outdated diff
   def active?
     return true unless self.diff
+    return false unless noteable
 
     noteable.diffs.each do |mr_diff|
       next unless mr_diff.new_path == self.diff.new_path
@@ -317,7 +375,7 @@ class Note < ActiveRecord::Base
   end
 
   def diff_file_index
-    line_code.split('_')[0]
+    line_code.split('_')[0] if line_code
   end
 
   def diff_file_name
@@ -333,11 +391,11 @@ class Note < ActiveRecord::Base
   end
 
   def diff_old_line
-    line_code.split('_')[1].to_i
+    line_code.split('_')[1].to_i if line_code
   end
 
   def diff_new_line
-    line_code.split('_')[2].to_i
+    line_code.split('_')[2].to_i if line_code
   end
 
   def generate_line_code(line)
@@ -358,25 +416,39 @@ class Note < ActiveRecord::Base
     @diff_line
   end
 
+  def diff_line_type
+    return @diff_line_type if @diff_line_type
+
+    if diff
+      diff_lines.each do |line|
+        if generate_line_code(line) == self.line_code
+          @diff_line_type = line.type
+        end
+      end
+    end
+
+    @diff_line_type
+  end
+
   def truncated_diff_lines
     max_number_of_lines = 16
     prev_match_line = nil
     prev_lines = []
 
     diff_lines.each do |line|
-      if generate_line_code(line) != self.line_code
-        if line.type == "match"
-          prev_lines.clear
-          prev_match_line = line
-        else
-          prev_lines.push(line)
-          prev_lines.shift if prev_lines.length >= max_number_of_lines
-        end
+      if line.type == "match"
+        prev_lines.clear
+        prev_match_line = line
       else
         prev_lines << line
-        return prev_lines
+        
+        break if generate_line_code(line) == self.line_code
+
+        prev_lines.shift if prev_lines.length >= max_number_of_lines
       end
     end
+
+    prev_lines
   end
 
   def diff_lines
@@ -421,6 +493,10 @@ class Note < ActiveRecord::Base
     for_merge_request? && for_diff_line?
   end
 
+  def for_project_snippet?
+    noteable_type == "Snippet"
+  end
+
   # override to return commits, which are not active record
   def noteable
     if for_commit?
@@ -444,6 +520,26 @@ class Note < ActiveRecord::Base
                 )
   end
 
+  def superceded?(notes)
+    return false unless vote?
+
+    notes.each do |note|
+      next if note == self
+
+      if note.vote? &&
+        self[:author_id] == note[:author_id] &&
+        self[:created_at] <= note[:created_at]
+        return true
+      end
+    end
+
+    false
+  end
+
+  def vote?
+    upvote? || downvote?
+  end
+
   def votable?
     for_issue? || (for_merge_request? && !for_diff_line?)
   end
@@ -465,7 +561,7 @@ class Note < ActiveRecord::Base
   end
 
   # FIXME: Hack for polymorphic associations with STI
-  #        For more information wisit http://api.rubyonrails.org/classes/ActiveRecord/Associations/ClassMethods.html#label-Polymorphic+Associations
+  #        For more information visit http://api.rubyonrails.org/classes/ActiveRecord/Associations/ClassMethods.html#label-Polymorphic+Associations
   def noteable_type=(sType)
     super(sType.to_s.classify.constantize.base_class.to_s)
   end
@@ -488,6 +584,6 @@ class Note < ActiveRecord::Base
   end
 
   def editable?
-    !system
+    !read_attribute(:system)
   end
 end
